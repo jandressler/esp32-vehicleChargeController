@@ -56,6 +56,8 @@ class DanfossTLX {
       String Unit[DATA_ENUMS] =     { "kWh",                    "kWh",                          "kWh",                      "V",                  "V",                     "V",                     "A",                     "A",                     "A",                     "Hz",                    "Hz",                   "Hz",                     "Hz",                    "mA",                    "mA",                    "mA",                    "V",                     "V",                     "V",                     "V",                     "V",                      "V",                    "A",                     "A",                     "A",                      "W",                    "W",                     "W",                     "W",          "kWh",                   "kWh",                   "kWh",                   "kWh",                    ""};
       float Meas[DATA_ENUMS];
       long  Raw[DATA_ENUMS];
+      bool Valid[DATA_ENUMS] = {};
+      uint32_t UpdatedAt[DATA_ENUMS] = {};
 
       String ProductNumber = ">>NotInitialized<<";  
       String SerialNumber = ">>NotInitialized<<";  

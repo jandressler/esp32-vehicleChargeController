@@ -272,6 +272,8 @@ void DanfossTLX::GetParameters(void){
   if (i == OpMode){
     UpdateMode(readingValid);
   }  
+  TLX.Valid[i] = readingValid;
+  TLX.UpdatedAt[i] = millis();
   i++;
   if(i >= DATA_ENUMS){
     i = TotalE;
@@ -282,15 +284,19 @@ void DanfossTLX::GetAllParameters(void){
 
   for (int i = 0; i <DATA_ENUMS; i++) {
     long TmpRaw = GetInvData(TLX.Cmd[i]);
+    bool readingValid = false;
     if (TmpRaw == NOTVALID){
       Serial.println(TLX.ParName[i] + " Raw Not Valid");
     }else{
       TLX.Raw[i] = TmpRaw;
       if(SanityCheck(i)){
         TLX.Meas[i] =float(TLX.Raw[i]) / TLX.Conv[i];
+        readingValid = true;
         if (i == OpMode) modeReadingValid = true;
       }
     }
+    TLX.Valid[i] = readingValid;
+    TLX.UpdatedAt[i] = millis();
   }
 
   UpdateMode(modeReadingValid);

@@ -641,25 +641,57 @@ allgemeinen Web-Schreibendpunkt.
 
 **Story 3.2 – Betriebsarten zentral verwalten**
 
-- Einen zentralen, typisierten Betriebsmodus mit `PV-Adaptiv` (Standard),
-  `Aus`, `Vollgas` und `Einstellbar` einführen. Alle Steuerwege rufen dieselbe
-  Moduswechsel-/Übergangsfunktion auf; die PV-Regelung darf nicht außerhalb
-  des PV-Modus schreiben.
-- Beim ESP-Neustart sicher in den festgelegten Standardmodus `PV-Adaptiv`
-  wechseln; manuelle Vollgas-/Einstellmodi dürfen nicht unbemerkt fortgesetzt
-  werden.
-- `Aus`: Laden über `frc=1` sperren. `PV-Adaptiv`: konservative PV-Regelung
-  aktivieren. `Vollgas`: `Auto`-Phasenwahl und freigegebenen Maximalstrom
-  verwenden. `Einstellbar`: nur validierte Strom-/Phaseneinstellungen
-  anwenden. Fehler und fehlgeschlagene Übergänge sichtbar melden.
+- Stand 08.11.2026: Typisierte Modi, zentraler Übergangspfad und
+  bestätigungs-/fehlerbewusste Statusfelder sind implementiert. `Start`
+  übernimmt 6–16 A und `Auto`/`Force_1`/`Force_3`; der Strom wird vor dem
+  Start gesetzt und Phasenbefehle werden erst bei bestätigter Ladefreigabe
+  angefordert. go-e `mpwst=120000` verlangt dabei 2 min stabilen Phasenwunsch;
+  `mptwt=600000` begrenzt den Abstand tatsächlicher Phasenwechsel auf 10 min.
+  Nach dem Klick auf `Vollgas` wurde `WAITING_FOR_PHASE_STABILITY`
+  beobachtet: Force-Off blieb aktiv (`frc=1`, `alw=false`), `psm=Force_1`.
+  Die alte Übergangsreihenfolge wartete auf die Phasenumstellung, bevor sie
+  den Ladevorgang freigab. Die korrigierte Firmware wurde geflasht. UI und
+  ungültige Startparameter (HTTP 400) geprüft; kein gültiger Start-POST wurde
+  ausgelöst. Nach dem Flash: `PV_ADAPTIVE`, Recovery `ACTIVE`,
+  `WAITING_FOR_START_RESERVE`, Charger `frc=1`, `alw=false`, `err=0`,
+  Phasenpräferenz `Auto`.
+  Die neue Reihenfolge setzt den Strom, startet gemäß Mindestintervall und
+  versucht eine nötige Phasenwahl erst bei bestätigter Ladefreigabe. Ein
+  erfolgreicher echter Start und eine dadurch ausgelöste Phasenwahl sind noch
+  live zu prüfen.
+- Rückmeldung 08.11.2026 nach Auswahl von 10 A: Übergang blieb auf
+  `WAITING_FOR_START_STOP_INTERVAL`; go-e stand weiter auf `frc=1`, `alw=false`,
+  `amp=10`, kein Ladebeginn. Ursache: der PV-Start/Stop-Zeitstempel aus dem
+  Startup-Recovery wurde auch für den ersten manuellen Start verwendet. Der
+  manuelle Start wartet jetzt nur nach einem zuvor tatsächlich gestarteten
+  und anschließend bestätigten manuellen Stopp 5 min; Startup-Force-Off zählt
+  nicht. `Aus` bleibt ein sofortiger Sicherheitsstopp. PV-Control-Status ist
+  im manuellen/Aus-Modus jetzt deaktiviert und wird nicht mehr als global
+  aktiv angezeigt. Eine frische Force-Off-Statusbestätigung gibt Startup-
+  Recovery sofort frei; nur erneute Stop-Schreibversuche bleiben auf 60 s
+  begrenzt. Korrektur gebaut und geflasht. Nach Neustart bestätigt: Recovery
+  `ACTIVE`, Modus `PV_ADAPTIVE`, Charger sicher gesperrt (`frc=1`,
+  `charge_allowed=false`, `err=0`); PV-Regelung aktiv.
+- Rückmeldung 08.11.2026: Manueller Start mit 9 A und anschließendes `Aus`
+  funktionieren direkt. Damit ist der manuelle Start-/Stopp-Pfad live
+  bestätigt; PV-Adaptiv-Ladezyklus und Phasenwechsel bleiben separat zu prüfen.
+- Beim ESP-Neustart `PV-Adaptiv` als Standardmodus verwenden; manuelle Modi
+  dürfen nicht unbemerkt fortgesetzt werden.
+- `Aus` sperrt Laden via `frc=1`; `PV-Adaptiv` nutzt die konservative
+  Überschussregelung. `Start` wendet die ausgewählten Strom-/Phasenwerte an.
+  Die PV-Regelung darf nur im PV-Modus schreiben.
+- Fehler und fehlgeschlagene Übergänge sichtbar melden.
 - Akzeptanz: Modusstatus und Chargerstatus bleiben konsistent; parallele
   Automatikpfade können keine Modusvorgabe überschreiben.
 
 **Story 3.3 – Weboberfläche für Betriebsarten**
 
+- `/` bietet `Aus`, `PV-Adaptiv` und `Start` mit validierten Reglern für
+  6–16 A und `Auto`/`Force_1`/`Force_3`. Übergangs- und Fehlerzustände werden
+  angezeigt. Manueller Start mit 9 A und anschließendes `Aus` sind live
+  bestätigt.
 - Aktuellen Modus, Chargerzustand, Regelziel, Messgültigkeit und Fehler klar
-  anzeigen; Bedienung für `Aus`, `PV-Adaptiv`, `Vollgas` und
-  `Einstellbar` bereitstellen.
+  anzeigen.
 - Nur begrenzte Modus-/Einstellungsbefehle akzeptieren, keinen generischen
   Charger-API-Proxy oder frei parametrierbaren Schreibendpunkt hinzufügen.
 - Akzeptanz: UI zeigt bestätigten Zustand und meldet abgelehnte/
@@ -667,40 +699,77 @@ allgemeinen Web-Schreibendpunkt.
 
 **Story 3.4 – Vollgasmodus**
 
-- Manuelles Laden unabhängig vom PV-Überschuss bis zur vom Charger/Fahrzeug
-  erlaubten Grenze ermöglichen; Phasenmodus `Auto`, Maximalstrom innerhalb
-  bestätigter go-e-Grenzen.
-- Über Web auf `Aus` oder `PV-Adaptiv` beendbar.
-- Akzeptanz: Modus ist sichtbar und manuell beendbar.
+- Mit Story 3.5 zum gemeinsamen `Start`-Modus zusammengeführt: 16 A und
+  `Auto` wählen und danach Start auslösen. Der gemeinsame manuelle Startpfad
+  ist mit 9 A live geprüft; 16 A/Phasenwahl bleiben gesondert zu prüfen.
 
 **Story 3.5 – Einstellbarer Lademodus**
 
-- Manuelles Stromlimit und – falls unterstützt – Phasenwahl ermöglichen.
-- Vorgesehener Bereich laut Anforderung: einphasig 6 A bis dreiphasig 16 A;
-  tatsächliche Grenzen mit Charger und Fahrzeug abgleichen. Nur feste,
-  validierte Wertebereiche annehmen.
+- `Start`-Formular akzeptiert 6–16 A sowie `Auto`/`Force_1`/`Force_3`.
+  Eingaben werden strikt validiert; jeder Start ist ein bewusster POST.
 
 **Story 3.6 – Rückkehr zum PV-Modus bei neuem PV-Tag**
 
-- Ohne Uhr eine dunkle Phase und anschließenden PV-Neubeginn anhand
-  stabiler PV-Leistung erkennen.
-- Nach manuellem Vollgas-/Einstellmodus bei erkannter Nacht (PV stabil offline
-  und danach stabil wieder online) automatisch auf `PV-Adaptiv` zurückschalten.
-- Zusätzlich sofort auf `PV-Adaptiv` zurückschalten, wenn das Fahrzeug als
-  ausgesteckt erkannt wird; dies gilt auch ohne vorherige Nachterkennung.
-  `PV-Adaptiv` bleibt damit immer der sichere Standardmodus nach einem
-  abgeschlossenen manuellen Ladevorgang.
+- Implementiert: nach einem manuellen Start (auch wenn danach `Aus` gewählt
+  wird) erkennt die Firmware eine Trennung nach zuvor verbundenem Fahrzeug
+  anhand zweier aufeinanderfolgender frischer go-e-Statuspolls und wechselt
+  zurück auf `PV-Adaptiv`. Ein allein gewähltes `Aus` ohne vorherigen
+  manuellen Start bleibt dagegen `Aus`.
+- Implementiert: ohne Uhr wird Nacht anhand der frischen TLX-PV-Eingangsleistung
+  erkannt (höchstens 50 W für 30 min); nach anschließend mindestens 5 min über
+  100 W wird auf `PV-Adaptiv` zurückgeschaltet. Ungültige/veraltete TLX-Werte
+  setzen die laufenden Zeitfenster zurück.
+- Noch live zu testen: Ausstecken nach manuellem Start und `Aus`, Tasterstart
+  sowie der Nacht-/PV-Neustart-Ablauf.
+- Firmware am 08.11.2026 gebaut und geflasht. Nach Neustart bestätigt:
+  `PV_ADAPTIVE`, Recovery `ACTIVE`, go-e `frc=1`, `alw=false`, `err=0`;
+  `lbp` wird im Status empfangen. Der anschließende Tastendrucktest ist unten
+  protokolliert.
+- Rückmeldung 08.11.2026: `Aus` > Ausstecken > `PV_ADAPTIVE` funktioniert.
+  Tasterdruck wurde nicht unmittelbar sichtbar, später zeigte der Charger
+  `amp=16`, `frc=1`, `alw=false`, `car=WaitCar`, während der Modus `START`
+  blieb. Der Taster wurde also erkannt und der Strom-Sollwert gesetzt; das
+  erneute Freigeben wartete auf das 5-minütige Start/Stopp-Intervall nach dem
+  letzten bestätigten manuellen Stopp. Der Nutzer bestätigte anschließend,
+  dass der Ladestart nach Ablauf dieser Wartezeit erfolgte. Die zunächst
+  angenommene 1-A/min-Rampe im manuellen Modus war nicht beabsichtigt:
+  manuelle Sollstromänderungen und der Tasterstart auf 16 A werden jetzt
+  direkt angewendet. Die 1-A/min-Begrenzung bleibt ausschließlich in der
+  PV-Regelung. Die 5-minütige manuelle Start/Stopp-Sperre und Phasen-
+  Schutzzeiten bleiben bestehen. Ein lokaler Statuszeiger auf einen
+  Stack-Puffer verursachte zusätzlich die unlesbare Übergangsanzeige.
+  Korrigiert: stabiler Übergangszustand mit verbleibender Wartezeit in `/All`
+  und verständlichem Hinweis auf der Website.
+  Build erfolgreich. Bei der anschließenden Liveprüfung stand die Steuerung
+  wieder auf `OFF` und der go-e auf `frc=1`, `alw=false`, `err=0`; erst dann
+  erfolgte der Flash der Statuskorrektur. Nach Neustart erneut `PV_ADAPTIVE`,
+  Recovery `ACTIVE` und Charger Force-Off bestätigt.
+- Letzter Fix am 08.11.2026: manuelle Stromvorgaben werden ohne 1-A/min-Rampe
+  direkt geschrieben; die Rampe gilt ausschließlich für die PV-Regelung.
+  Manueller 5-minütiger Neustartabstand und Phasenwartezeiten bleiben erhalten.
+  Build und Flash erfolgreich, go-e weiterhin sicher gestoppt. Nach diesem
+  Neustart meldet `/All` wiederholt `TLX communication unavailable`, während
+  DS100 und go-e antworten. Der Nutzer hat den ESP32 aus- und wieder
+  eingesteckt; danach antwortet der TLX wieder. Im Livewert bleibt `GridP2`
+  auffällig bei `48967 W`, während die beiden anderen Phasen etwa 170–190 W
+  und `GridP` etwa 550 W zeigen. Die PV-Regelung verwendet DS100-Netzleistung,
+  nicht diesen TLX-Kanal. Beim längeren Test trotzdem beide Werte beobachten
+  und eine Abweichung im Protokoll festhalten.
 - Akzeptanz: kurze Wolken oder Leistungsschwankungen lösen keinen falschen
   Tageswechsel aus; Ausstecken wird zuverlässig erkannt; Verhalten nach
   ESP32-Neustart ist definiert.
 
 ### Epic 4 – Tasterbedienung und optionale Historie
 
-- **Story 4.1 – go-e-Taster startet Vollgasmodus:** erkannte `lbp`-Änderung
-  ruft denselben zentralen Moduswechsel wie die Weboberfläche auf und setzt
-  `Vollgas`. App-Sperren `sdp=0` und `bac=0` bleiben aktiv. Mehrere
-  Tastendrücke und die Entprellung/Neustartbehandlung vor der Integration
-  bestätigen. Web bleibt der Weg, `Aus` bzw. `PV-Adaptiv` wieder auszuwählen.
+- **Story 4.1 – go-e-Taster startet Laden:** Implementiert. Eine neu erkannte,
+  steigende `lbp`-Zeit nach einem initialen Status-Baseline-Sample startet
+  über den zentralen Moduswechsel mit 16 A und `Auto`. Bei Neustart oder
+  längerer Polling-Lücke wird kein nachträglicher Tastendruck angenommen.
+  App-Sperren `sdp=0` und `bac=0` bleiben unverändert. Tasterereignis und
+  `amp=16` sowie der anschließende Start nach Ablauf des 5-minütigen
+  Start/Stopp-Intervalls wurden live bestätigt. Manueller Sollstrom wird
+  direkt geschrieben; die PV-Regelung behält ihre eigene 1-A/min-Rampe.
+  Web bleibt der Weg, `Aus` bzw. `PV-Adaptiv` auszuwählen.
 - Fehlerzustände und veraltete Messwerte auch in der Webansicht anzeigen; bei
   ungültigen Werten sicher reagieren.
 - Datenhistorie für Wohnungsverbrauch, PV-Leistung und weitere Kanäle erst
@@ -713,12 +782,13 @@ allgemeinen Web-Schreibendpunkt.
    PV-/Phasenregelung sind nach Neustart gesperrt, bis ein frischer go-e-Status
    Force-Off bestätigt.
 2. Story 3.2 – zentrale Modusverwaltung und sichere Übergänge.
-3. Story 3.3 – Webstatus und begrenzte Bedienung aller vier Modi.
-4. Story 3.4/3.5 – Vollgas und einstellbaren Modus Schritt für Schritt
-   validieren.
-5. Story 3.6 – Rückkehr zum PV-Modus bei Nacht-/PV-Neustart oder erkanntem
-   Ausstecken.
-6. Story 4.1 – Taster setzt Vollgas über denselben Moduswechselpfad.
+3. Story 3.3 – Webstatus und sichere Bedienung von `Aus`, `PV-Adaptiv` und
+   `Start` live prüfen.
+4. Startablauf live mit gewähltem Strom/Phasenwunsch beobachten; insbesondere
+   5-minütigen Startabstand und anschließende go-e-Phasenwahl verifizieren.
+5. Story 3.6/4.1 auf dem Gerät testen: manueller Start, `Aus`, ausstecken;
+   anschließend go-e-Tasterstart und Rückkehr nach erneutem Ausstecken.
+6. Nacht-/PV-Neustart-Rückkehr über längere Beobachtung prüfen.
 7. Optionale Datenspeicherung zuletzt bewerten.
 
 ## Arbeitsregeln für die nächsten Tests

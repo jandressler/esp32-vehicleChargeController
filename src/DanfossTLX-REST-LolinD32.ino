@@ -25,7 +25,7 @@ enum class ChargingMode : uint8_t;
 #define BLYNK_PRINT Serial
 #define RXD2 16
 #define TXD2 17
-#define GOE_STATUS_URL "http://192.168.2.190/api/status?filter=fwv,typ,alw,alwt,amp,acu,frc,car,err,nrg,lccfc,lcctc,psm,fsp,lfspt,rbt,mptwt,mpwst,pnp,pwm"
+#define GOE_STATUS_URL "http://192.168.2.190/api/status?filter=fwv,typ,alw,alwt,amp,acu,frc,car,err,nrg,lccfc,lcctc,lbp,psm,fsp,lfspt,rbt,mptwt,mpwst,pnp,pwm"
 #define GOE_SET_URL "http://192.168.2.190/api/set?"
 
 String Program="DanfossTLX-REST";
@@ -73,12 +73,18 @@ constexpr uint32_t GOE_PV_START_STOP_INTERVAL_MS = 300000;
 constexpr uint32_t GOE_PV_STOP_HOLD_MS = 300000;
 constexpr uint32_t GOE_PV_METER_STALE_MS = 30000;
 constexpr uint32_t GOE_PV_SAFETY_STOP_RETRY_MS = 60000;
+constexpr uint32_t GOE_MANUAL_PV_STATUS_MAX_AGE_MS = 90000;
+constexpr uint32_t GOE_MANUAL_PV_OFFLINE_HOLD_MS = 1800000;
+constexpr uint32_t GOE_MANUAL_PV_ONLINE_HOLD_MS = 300000;
+constexpr uint32_t GOE_MANUAL_UNPLUG_CONFIRM_SAMPLES = 2;
 constexpr uint32_t GOE_PV_LIMIT_CURRENT_ERROR_COUNT = 3;
 constexpr uint32_t GOE_PV_STOP_ERROR_COUNT = 6;
 constexpr int GOE_PV_MIN_CURRENT_A = 6;
 constexpr int GOE_PV_MAX_CURRENT_A = 16;
 constexpr float GOE_PV_PHASE_VOLTAGE_V = 230.0f;
 constexpr float GOE_PV_SAFETY_RESERVE_W = 500.0f;
+constexpr float GOE_MANUAL_PV_OFFLINE_THRESHOLD_W = 50.0f;
+constexpr float GOE_MANUAL_PV_ONLINE_THRESHOLD_W = 100.0f;
 constexpr uint8_t GOE_GRID_POWER_SAMPLE_CAPACITY = 16;
 
 struct GridPowerSample {
@@ -111,6 +117,13 @@ bool pvSafetyStopAttemptClockInitialized = false;
 uint32_t pvLastSafetyStopAttemptAt = 0;
 bool startupSafeStopPending = false;
 uint32_t startupSafeStopLastAttemptAt = 0;
+bool manualPvReturnArmed = false;
+bool manualCarConnectedSeen = false;
+uint8_t manualUnplugSampleCount = 0;
+uint32_t manualLastCarStateSampleAt = 0;
+uint32_t manualPvOfflineSince = 0;
+uint32_t manualPvOnlineSince = 0;
+bool manualPvNightObserved = false;
 
 struct GoEStatus {
   bool valid = false;
@@ -144,6 +157,8 @@ struct GoEStatus {
   int64_t lastChangedFromChargingMs = 0;
   bool lastChangedToChargingValid = false;
   int64_t lastChangedToChargingMs = 0;
+  bool lastButtonPressValid = false;
+  int64_t lastButtonPressMs = 0;
   int energy[16] = {};
   uint8_t energyCount = 0;
   String chargerType;
@@ -169,8 +184,8 @@ bool phaseAvailableSurplusValid = false;
 float phaseAvailableSurplusW = 0.0f;
 
 enum class ChargingMode : uint8_t {
+  Off,
   PvAdaptive,
-  FullPower,
   ManualPower
 };
 
@@ -179,7 +194,32 @@ enum class GoEPhasePreference : uint8_t {
   ForceOnePhase = 1,
   ForceThreePhases = 2
 };
+
+enum class GoEPhaseRequestResult : uint8_t {
+  CommandSent,
+  AlreadySet,
+  StatusUnavailable,
+  WaitingForChargePermission,
+  WaitingForStability,
+  WaitingForControllerInterval,
+  WaitingForChargerInterval,
+  WriteFailed
+};
+
 ChargingMode chargingMode = ChargingMode::PvAdaptive;
+int manualCurrentA = GOE_PV_MAX_CURRENT_A;
+uint8_t manualPhasePreference =
+    static_cast<uint8_t>(GoEPhasePreference::Auto);
+const char *chargingModeTransitionState = "STARTUP_RECOVERY";
+bool chargingModeTransitionPending = false;
+uint32_t modeLastCommandAt = 0;
+uint32_t modeCommandSentAt = 0;
+bool modeCommandClockInitialized = false;
+bool modeCommandAwaitingStatus = false;
+uint32_t modePhaseRequestedAt = 0;
+bool manualStartStopIntervalInitialized = false;
+uint32_t manualLastStartStopCommandAt = 0;
+bool manualOffConfirmationPending = false;
 
 JsonDocument jsonDocument;
 char jsonbuffer[3072];
@@ -204,6 +244,260 @@ const char *phasePreferenceText(uint8_t preference) {
     case GoEPhasePreference::ForceThreePhases: return "Force_3";
     default: return "Unrecognized";
   }
+}
+
+const char *chargingModeText(ChargingMode mode) {
+  switch (mode) {
+    case ChargingMode::Off: return "OFF";
+    case ChargingMode::PvAdaptive: return "PV_ADAPTIVE";
+    case ChargingMode::ManualPower: return "START";
+    default: return "UNRECOGNIZED";
+  }
+}
+
+bool requestChargingMode(
+    ChargingMode mode, int requestedCurrentA = GOE_PV_MIN_CURRENT_A,
+    uint8_t requestedPhasePreference =
+        static_cast<uint8_t>(GoEPhasePreference::Auto)) {
+  switch (mode) {
+    case ChargingMode::Off:
+    case ChargingMode::PvAdaptive:
+      break;
+    case ChargingMode::ManualPower:
+      if (requestedCurrentA < GOE_PV_MIN_CURRENT_A ||
+          requestedCurrentA > GOE_PV_MAX_CURRENT_A ||
+          requestedPhasePreference >
+              static_cast<uint8_t>(GoEPhasePreference::ForceThreePhases)) {
+        Serial.printf(
+            "charging mode request rejected: invalid manual settings %dA, psm=%u\n",
+            requestedCurrentA, requestedPhasePreference);
+        chargingModeTransitionState = "INVALID_MANUAL_SETTINGS";
+        chargingModeTransitionPending = false;
+        return false;
+      }
+      manualCurrentA = requestedCurrentA;
+      manualPhasePreference = requestedPhasePreference;
+      break;
+    default:
+      Serial.println("charging mode request rejected: unknown mode");
+      chargingModeTransitionState = "INVALID_MODE";
+      chargingModeTransitionPending = false;
+      return false;
+  }
+
+  if (chargingMode != mode) {
+    Serial.printf("charging mode requested: %s\n", chargingModeText(mode));
+    if (mode == ChargingMode::ManualPower && !manualPvReturnArmed) {
+      manualPvReturnArmed = true;
+      manualCarConnectedSeen =
+          goEStatus.valid && goEStatus.carStateValid &&
+          millis() - goEStatus.updatedAt <= GOE_PHASE_STATUS_MAX_AGE_MS &&
+          goEStatus.carState >= 2 && goEStatus.carState <= 4;
+      manualUnplugSampleCount = 0;
+      manualLastCarStateSampleAt = 0;
+      manualPvOfflineSince = 0;
+      manualPvOnlineSince = 0;
+      manualPvNightObserved = false;
+    }
+    if (mode == ChargingMode::Off &&
+        chargingMode == ChargingMode::ManualPower &&
+        manualStartStopIntervalInitialized) {
+      manualOffConfirmationPending = true;
+    }
+    chargingMode = mode;
+    if (mode == ChargingMode::PvAdaptive) {
+      pvControllerStateInitialized = false;
+      pvStartConditionSince = 0;
+      pvStopConditionSince = 0;
+      manualPvReturnArmed = false;
+      manualCarConnectedSeen = false;
+      manualUnplugSampleCount = 0;
+      manualLastCarStateSampleAt = 0;
+      manualPvOfflineSince = 0;
+      manualPvOnlineSince = 0;
+      manualPvNightObserved = false;
+    }
+  }
+  modeCommandAwaitingStatus = false;
+  modeCommandClockInitialized = false;
+  modePhaseRequestedAt = millis();
+  chargingModeTransitionState = "PENDING";
+  chargingModeTransitionPending = true;
+  return true;
+}
+
+uint32_t manualStartStopWaitRemainingMs() {
+  if (chargingMode != ChargingMode::ManualPower ||
+      !manualStartStopIntervalInitialized || !goEStatus.valid ||
+      goEStatus.forceMode == 0) {
+    return 0;
+  }
+  const uint32_t elapsed = millis() - manualLastStartStopCommandAt;
+  if (elapsed >= GOE_PV_START_STOP_INTERVAL_MS) {
+    return 0;
+  }
+  return GOE_PV_START_STOP_INTERVAL_MS - elapsed;
+}
+
+void updateNonAdaptiveChargingMode() {
+  const uint32_t now = millis();
+  const bool goEStatusFresh =
+      goEStatus.valid && now - goEStatus.updatedAt <= GOE_PHASE_STATUS_MAX_AGE_MS;
+  if (chargingMode == ChargingMode::Off) {
+    pvControllerCharging = false;
+    if (goEStatusFresh && goEStatus.forceMode == 1 &&
+        !goEStatus.chargeAllowed) {
+      if (manualOffConfirmationPending) {
+        manualLastStartStopCommandAt = now;
+        manualOffConfirmationPending = false;
+      }
+      chargingModeTransitionState = "ACTIVE";
+      chargingModeTransitionPending = false;
+      modeCommandAwaitingStatus = false;
+      return;
+    }
+    if (!modeCommandClockInitialized ||
+        now - modeLastCommandAt >= GOE_PV_SAFETY_STOP_RETRY_MS) {
+      modeLastCommandAt = now;
+      modeCommandClockInitialized = true;
+      if (writeGoEForceMode(1)) {
+        if (manualOffConfirmationPending) {
+          manualLastStartStopCommandAt = now;
+          manualOffConfirmationPending = false;
+        }
+        pvLastStartStopCommandAt = now;
+        pvStartStopClockInitialized = true;
+        chargingModeTransitionState = "WAITING_FOR_OFF_CONFIRMATION";
+      } else {
+        chargingModeTransitionState = "OFF_COMMAND_FAILED";
+      }
+    }
+    return;
+  }
+
+  if (!goEStatusFresh) {
+    chargingModeTransitionState = "WAITING_FOR_FRESH_GO_E_STATUS";
+    modeCommandAwaitingStatus = false;
+    if (!modeCommandClockInitialized ||
+        now - modeLastCommandAt >= GOE_PV_SAFETY_STOP_RETRY_MS) {
+      modeLastCommandAt = now;
+      modeCommandClockInitialized = true;
+      if (writeGoEForceMode(1)) {
+        pvLastStartStopCommandAt = now;
+        pvStartStopClockInitialized = true;
+        chargingModeTransitionState = "STOPPING_FOR_STALE_GO_E_STATUS";
+      }
+    }
+    return;
+  }
+  if (goEStatus.forceMode == 2) {
+    chargingModeTransitionState = "BLOCKED_BY_EXTERNAL_FORCE_ON";
+    modeCommandAwaitingStatus = false;
+    return;
+  }
+  if (modeCommandAwaitingStatus) {
+    if (static_cast<int32_t>(goEStatus.updatedAt - modeCommandSentAt) <= 0) {
+      chargingModeTransitionState = "WAITING_FOR_GO_E_CONFIRMATION";
+      return;
+    }
+    modeCommandAwaitingStatus = false;
+  }
+
+  const int requestedCurrent = manualCurrentA;
+
+  if (goEStatus.requestedCurrent != requestedCurrent) {
+    if (modeCommandClockInitialized &&
+        now - modeLastCommandAt < GOE_POLL_INTERVAL_MS) {
+      return;
+    }
+    modeLastCommandAt = now;
+    modeCommandClockInitialized = true;
+    if (writeGoERequestedCurrent(requestedCurrent)) {
+      modeCommandAwaitingStatus = true;
+      modeCommandSentAt = now;
+      chargingModeTransitionState = "WAITING_FOR_CURRENT_CONFIRMATION";
+    } else {
+      chargingModeTransitionState = "CURRENT_COMMAND_FAILED";
+    }
+    return;
+  }
+
+  if (goEStatus.forceMode != 0) {
+    if (manualStartStopIntervalInitialized &&
+        now - manualLastStartStopCommandAt <
+            GOE_PV_START_STOP_INTERVAL_MS) {
+      chargingModeTransitionState = "WAITING_FOR_PREVIOUS_MANUAL_STOP_INTERVAL";
+      return;
+    }
+    if (modeCommandClockInitialized &&
+        now - modeLastCommandAt < GOE_POLL_INTERVAL_MS) {
+      return;
+    }
+    modeLastCommandAt = now;
+    modeCommandClockInitialized = true;
+    if (writeGoEForceMode(0)) {
+      pvLastStartStopCommandAt = now;
+      pvStartStopClockInitialized = true;
+      manualLastStartStopCommandAt = now;
+      manualStartStopIntervalInitialized = true;
+      modeCommandAwaitingStatus = true;
+      modeCommandSentAt = now;
+      chargingModeTransitionState = "WAITING_FOR_CHARGE_PERMISSION";
+    } else {
+      chargingModeTransitionState = "CHARGE_ENABLE_FAILED";
+    }
+    return;
+  }
+  if (!goEStatus.chargeAllowed) {
+    chargingModeTransitionState = "WAITING_FOR_CHARGER_PERMISSION";
+    return;
+  }
+
+  if (!goEStatus.phasePreferenceValid) {
+    chargingModeTransitionState = "WAITING_FOR_PHASE_STATUS";
+    return;
+  }
+  if (goEStatus.phasePreference != manualPhasePreference) {
+    const GoEPhaseRequestResult phaseRequest = requestGoEPhasePreference(
+        manualPhasePreference, modePhaseRequestedAt);
+    switch (phaseRequest) {
+      case GoEPhaseRequestResult::CommandSent:
+        modeLastCommandAt = now;
+        modeCommandClockInitialized = true;
+        modeCommandAwaitingStatus = true;
+        modeCommandSentAt = now;
+        chargingModeTransitionState = "WAITING_FOR_PHASE_CONFIRMATION";
+        break;
+      case GoEPhaseRequestResult::AlreadySet:
+        chargingModeTransitionState = "ACTIVE";
+        chargingModeTransitionPending = false;
+        break;
+      case GoEPhaseRequestResult::StatusUnavailable:
+        chargingModeTransitionState = "WAITING_FOR_PHASE_STATUS";
+        break;
+      case GoEPhaseRequestResult::WaitingForChargePermission:
+        chargingModeTransitionState =
+            "WAITING_FOR_CHARGE_PERMISSION_BEFORE_PHASE_CHANGE";
+        break;
+      case GoEPhaseRequestResult::WaitingForStability:
+        chargingModeTransitionState = "WAITING_FOR_PHASE_STABILITY";
+        break;
+      case GoEPhaseRequestResult::WaitingForControllerInterval:
+        chargingModeTransitionState = "WAITING_FOR_PHASE_COMMAND_INTERVAL";
+        break;
+      case GoEPhaseRequestResult::WaitingForChargerInterval:
+        chargingModeTransitionState = "WAITING_FOR_CHARGER_PHASE_INTERVAL";
+        break;
+      case GoEPhaseRequestResult::WriteFailed:
+        chargingModeTransitionState = "PHASE_COMMAND_FAILED";
+        break;
+    }
+    return;
+  }
+
+  pvControllerCharging = goEStatus.forceMode == 0 && goEStatus.chargeAllowed;
+  chargingModeTransitionState = "ACTIVE";
+  chargingModeTransitionPending = false;
 }
 
 void pollGoEStatus() {
@@ -250,6 +544,7 @@ void pollGoEStatus() {
   const JsonVariantConst chargeAllowedChangedAt = response["alwt"];
   const JsonVariantConst lastChangedFromCharging = response["lccfc"];
   const JsonVariantConst lastChangedToCharging = response["lcctc"];
+  const JsonVariantConst lastButtonPress = response["lbp"];
   const JsonVariantConst phasePreference = response["psm"];
   const JsonVariantConst forceSinglePhase = response["fsp"];
   const JsonVariantConst lastPhaseToggle = response["lfspt"];
@@ -270,7 +565,8 @@ void pollGoEStatus() {
       !response["nrg"].is<JsonArray>() ||
       response["nrg"].as<JsonArray>().size() > 16 ||
       !(lastChangedFromCharging.isNull() || lastChangedFromCharging.is<int64_t>()) ||
-      !(lastChangedToCharging.isNull() || lastChangedToCharging.is<int64_t>())) {
+      !(lastChangedToCharging.isNull() || lastChangedToCharging.is<int64_t>()) ||
+      !(lastButtonPress.isNull() || lastButtonPress.is<int64_t>())) {
     goEStatus.valid = false;
     goEStatus.error = "Required status field missing or has wrong type";
     Serial.printf("go-e status failed after %lu ms: %s\n",
@@ -331,6 +627,10 @@ void pollGoEStatus() {
   goEStatus.lastChangedToChargingMs = goEStatus.lastChangedToChargingValid
       ? lastChangedToCharging.as<int64_t>()
       : 0;
+  goEStatus.lastButtonPressValid = !lastButtonPress.isNull();
+  goEStatus.lastButtonPressMs = goEStatus.lastButtonPressValid
+      ? lastButtonPress.as<int64_t>()
+      : 0;
   const JsonArray energy = response["nrg"].as<JsonArray>();
   goEStatus.energyCount = energy.size();
   for (uint8_t i = 0; i < goEStatus.energyCount; ++i) {
@@ -339,6 +639,30 @@ void pollGoEStatus() {
   goEStatus.valid = true;
   goEStatus.error = "";
   goEStatus.updatedAt = millis();
+
+  static bool buttonPressBaselineValid = false;
+  static int64_t previousButtonPressMs = 0;
+  static uint32_t previousButtonPollAt = 0;
+  bool buttonPressDetected = false;
+  if (goEStatus.lastButtonPressValid) {
+    if (buttonPressBaselineValid &&
+        goEStatus.lastButtonPressMs > previousButtonPressMs &&
+        goEStatus.updatedAt - previousButtonPollAt <=
+            GOE_POLL_INTERVAL_MS * 2) {
+      buttonPressDetected = true;
+    }
+    previousButtonPressMs = goEStatus.lastButtonPressMs;
+    previousButtonPollAt = goEStatus.updatedAt;
+    buttonPressBaselineValid = true;
+  } else {
+    buttonPressBaselineValid = false;
+  }
+  if (buttonPressDetected) {
+    Serial.println("go-e button press detected; requesting 16A Auto start");
+    requestChargingMode(
+        ChargingMode::ManualPower, GOE_PV_MAX_CURRENT_A,
+        static_cast<uint8_t>(GoEPhasePreference::Auto));
+  }
 
   static bool previousSampleValid = false;
   static bool previousChargeAllowed = false;
@@ -406,6 +730,97 @@ void pollGoEStatus() {
     Serial.printf("%s%d", i ? "," : "", goEStatus.energy[i]);
   }
   Serial.println("]");
+}
+
+bool getFreshTlxPvInputPower(float &powerW) {
+  const uint32_t now = millis();
+  const DanfossTLX::Par_e readings[] = {
+      DanfossTLX::PvV1, DanfossTLX::PvV2,
+      DanfossTLX::PvA1, DanfossTLX::PvA2};
+  for (const DanfossTLX::Par_e reading : readings) {
+    if (!MyTLX.TLX.Valid[reading] ||
+        now - MyTLX.TLX.UpdatedAt[reading] >
+            GOE_MANUAL_PV_STATUS_MAX_AGE_MS) {
+      return false;
+    }
+  }
+  powerW = MyTLX.TLX.Meas[DanfossTLX::PvV1] *
+          MyTLX.TLX.Meas[DanfossTLX::PvA1] +
+      MyTLX.TLX.Meas[DanfossTLX::PvV2] *
+          MyTLX.TLX.Meas[DanfossTLX::PvA2];
+  return true;
+}
+
+void returnToPvAdaptiveMode(const char *reason) {
+  if (chargingMode == ChargingMode::PvAdaptive || !manualPvReturnArmed) {
+    return;
+  }
+  Serial.printf("automatic return to PV-Adaptiv: %s\n", reason);
+  requestChargingMode(ChargingMode::PvAdaptive);
+}
+
+void updateManualModeAutomaticReturn() {
+  if (!manualPvReturnArmed ||
+      (chargingMode != ChargingMode::ManualPower &&
+       chargingMode != ChargingMode::Off)) {
+    return;
+  }
+
+  const uint32_t now = millis();
+  const bool goEStatusFresh =
+      goEStatus.valid &&
+      now - goEStatus.updatedAt <= GOE_PHASE_STATUS_MAX_AGE_MS;
+  if (goEStatusFresh &&
+      goEStatus.updatedAt != manualLastCarStateSampleAt) {
+    manualLastCarStateSampleAt = goEStatus.updatedAt;
+    if (goEStatus.carStateValid) {
+      if (goEStatus.carState >= 2 && goEStatus.carState <= 4) {
+        manualCarConnectedSeen = true;
+        manualUnplugSampleCount = 0;
+      } else if (goEStatus.carState == 1 && manualCarConnectedSeen) {
+        if (manualUnplugSampleCount < GOE_MANUAL_UNPLUG_CONFIRM_SAMPLES) {
+          ++manualUnplugSampleCount;
+        }
+      } else {
+        manualUnplugSampleCount = 0;
+      }
+    }
+  }
+  if (manualUnplugSampleCount >= GOE_MANUAL_UNPLUG_CONFIRM_SAMPLES) {
+    returnToPvAdaptiveMode("vehicle disconnected");
+    return;
+  }
+
+  float pvInputPowerW = 0.0f;
+  if (!getFreshTlxPvInputPower(pvInputPowerW)) {
+    manualPvOfflineSince = 0;
+    manualPvOnlineSince = 0;
+    return;
+  }
+
+  if (pvInputPowerW <= GOE_MANUAL_PV_OFFLINE_THRESHOLD_W) {
+    if (manualPvOfflineSince == 0) {
+      manualPvOfflineSince = now;
+    }
+    manualPvOnlineSince = 0;
+    if (now - manualPvOfflineSince >= GOE_MANUAL_PV_OFFLINE_HOLD_MS) {
+      manualPvNightObserved = true;
+    }
+  } else {
+    manualPvOfflineSince = 0;
+  }
+
+  if (manualPvNightObserved &&
+      pvInputPowerW >= GOE_MANUAL_PV_ONLINE_THRESHOLD_W) {
+    if (manualPvOnlineSince == 0) {
+      manualPvOnlineSince = now;
+    }
+    if (now - manualPvOnlineSince >= GOE_MANUAL_PV_ONLINE_HOLD_MS) {
+      returnToPvAdaptiveMode("PV production resumed after night");
+    }
+  } else {
+    manualPvOnlineSince = 0;
+  }
 }
 
 bool writeGoEPhasePreference(uint8_t preference) {
@@ -513,14 +928,18 @@ bool writeGoEForceMode(uint8_t forceMode) {
   return true;
 }
 
-bool requestGoEPhasePreference(uint8_t preference, uint32_t desiredSinceMs) {
+GoEPhaseRequestResult requestGoEPhasePreference(
+    uint8_t preference, uint32_t desiredSinceMs) {
   if (preference > static_cast<uint8_t>(GoEPhasePreference::ForceThreePhases) ||
       !goEStatus.valid || !goEStatus.phasePreferenceValid ||
       millis() - goEStatus.updatedAt > GOE_PHASE_STATUS_MAX_AGE_MS) {
-    return false;
+    return GoEPhaseRequestResult::StatusUnavailable;
   }
   if (goEStatus.phasePreference == preference) {
-    return true;
+    return GoEPhaseRequestResult::AlreadySet;
+  }
+  if (!goEStatus.chargeAllowed || goEStatus.forceMode != 0) {
+    return GoEPhaseRequestResult::WaitingForChargePermission;
   }
 
   const uint32_t now = millis();
@@ -536,7 +955,9 @@ bool requestGoEPhasePreference(uint8_t preference, uint32_t desiredSinceMs) {
   if (now - desiredSinceMs < stableTimeMs ||
       (phaseCommandClockInitialized &&
        now - lastPhaseCommandAt < GOE_PHASE_MIN_COMMAND_INTERVAL_MS)) {
-    return false;
+    return now - desiredSinceMs < stableTimeMs
+        ? GoEPhaseRequestResult::WaitingForStability
+        : GoEPhaseRequestResult::WaitingForControllerInterval;
   }
 
   if (goEStatus.lastPhaseToggleValid && goEStatus.chargerUptimeValid &&
@@ -553,21 +974,25 @@ bool requestGoEPhasePreference(uint8_t preference, uint32_t desiredSinceMs) {
         ? reportedMinimumWaitMs
         : GOE_PHASE_MIN_COMMAND_INTERVAL_MS;
     if (elapsedSinceToggleMs < minimumWaitMs) {
-      return false;
+      return GoEPhaseRequestResult::WaitingForChargerInterval;
     }
   }
 
   if (!writeGoEPhasePreference(preference)) {
-    return false;
+    return GoEPhaseRequestResult::WriteFailed;
   }
   lastPhaseCommandAt = now;
   phaseCommandClockInitialized = true;
-  return true;
+  return GoEPhaseRequestResult::CommandSent;
 }
 
 void updateGoEPhasePolicy(ChargingMode mode) {
   phaseAvailableSurplusValid = false;
   if (startupSafeStopPending) {
+    phaseTargetInitialized = false;
+    return;
+  }
+  if (mode != ChargingMode::PvAdaptive) {
     phaseTargetInitialized = false;
     return;
   }
@@ -663,27 +1088,41 @@ void updateGoEPvChargingPolicy() {
   if (startupSafeStopPending) {
     pvControlState = "STARTUP_SAFE_STOP_PENDING";
     pvControlAction = "STOP";
+    if (goEStatus.valid &&
+        now - goEStatus.updatedAt <= GOE_PHASE_STATUS_MAX_AGE_MS &&
+        goEStatus.forceMode == 1 && !goEStatus.chargeAllowed) {
+      startupSafeStopPending = false;
+      pvControllerCharging = false;
+      pvControllerStateInitialized = true;
+      pvControlState = "STARTUP_SAFE_STOP_CONFIRMED";
+      pvControlAction = "NONE";
+      chargingModeTransitionState = "ACTIVE";
+      chargingModeTransitionPending = false;
+      startupSafeStopLastAttemptAt = 0;
+      pvLastStartStopCommandAt = now;
+      pvStartStopClockInitialized = true;
+      return;
+    }
     if (startupSafeStopLastAttemptAt == 0 ||
         now - startupSafeStopLastAttemptAt >= GOE_PV_SAFETY_STOP_RETRY_MS) {
-      if (goEStatus.valid && goEStatus.forceMode == 1 &&
-          !goEStatus.chargeAllowed) {
-        startupSafeStopPending = false;
-        pvControllerCharging = false;
-        pvControllerStateInitialized = true;
-        pvControlState = "STARTUP_SAFE_STOP_CONFIRMED";
-        pvControlAction = "NONE";
-        startupSafeStopLastAttemptAt = 0;
-        pvLastStartStopCommandAt = now;
-        pvStartStopClockInitialized = true;
+      startupSafeStopLastAttemptAt = now;
+      if (writeGoEForceMode(1)) {
+        pvControlState = "STARTUP_STOP_SENT_WAITING_CONFIRMATION";
       } else {
-        startupSafeStopLastAttemptAt = now;
-        if (writeGoEForceMode(1)) {
-          pvControlState = "STARTUP_STOP_SENT_WAITING_CONFIRMATION";
-        } else {
-          pvControlState = "STARTUP_STOP_FAILED_RETRYING";
-        }
+        pvControlState = "STARTUP_STOP_FAILED_RETRYING";
       }
     }
+    return;
+  }
+  if (chargingMode != ChargingMode::PvAdaptive) {
+    pvControlState = chargingMode == ChargingMode::Off
+        ? "MODE_OFF"
+        : (goEStatus.valid && goEStatus.forceMode == 0 &&
+                   goEStatus.chargeAllowed
+               ? "MANUAL_MODE_ACTIVE"
+               : "MANUAL_MODE_STARTING");
+    pvControlAction = "NONE";
+    updateNonAdaptiveChargingMode();
     return;
   }
 
@@ -712,6 +1151,10 @@ void updateGoEPvChargingPolicy() {
     pvControllerStateInitialized = true;
     pvControlState = "EXTERNAL_FORCE_ON";
     return;
+  }
+  if (chargingModeTransitionPending) {
+    chargingModeTransitionState = "ACTIVE";
+    chargingModeTransitionPending = false;
   }
   if (!pvControllerStateInitialized) {
     pvControllerCharging =
@@ -1008,7 +1451,19 @@ void CreateJsonAll(void){
   charger["valid"] = goEStatus.valid;
   charger["updated_ms"] = goEStatus.updatedAt;
   charger["error"] = goEStatus.error;
-  charger["pv_control_enabled"] = GOE_PV_CONTROL_ENABLED;
+  charger["pv_control_enabled"] =
+      GOE_PV_CONTROL_ENABLED && chargingMode == ChargingMode::PvAdaptive;
+  charger["charging_mode"] = chargingModeText(chargingMode);
+  charger["mode_transition_state"] = chargingModeTransitionState;
+  charger["mode_transition_pending"] = chargingModeTransitionPending;
+  charger["automatic_pv_return_armed"] = manualPvReturnArmed;
+  charger["manual_vehicle_connected_seen"] = manualCarConnectedSeen;
+  charger["manual_pv_night_observed"] = manualPvNightObserved;
+  charger["manual_current_a"] = manualCurrentA;
+  charger["manual_phase_preference"] =
+      phasePreferenceText(manualPhasePreference);
+  charger["manual_start_wait_remaining_ms"] =
+      manualStartStopWaitRemainingMs();
   charger["pv_control_state"] = pvControlState;
   charger["pv_control_action"] = pvControlAction;
   charger["pv_target_current_a"] = pvTargetCurrentA;
@@ -1106,6 +1561,11 @@ void CreateJsonAll(void){
       charger["car_state_text"] = "Unavailable";
     }
     charger["error_code"] = goEStatus.errorCode;
+    if (goEStatus.lastButtonPressValid) {
+      charger["last_button_press_ms"] = goEStatus.lastButtonPressMs;
+    } else {
+      charger["last_button_press_ms"] = nullptr;
+    }
     if (goEStatus.lastChangedFromChargingValid) {
       charger["last_changed_from_charging_ms"] = goEStatus.lastChangedFromChargingMs;
     } else {
@@ -1140,10 +1600,31 @@ void CreateJsonTxt(const char *tag, const char *value) {
   
 // Web page that holds all parameters/measurements in a table
 void HandleRoot() {
-  constexpr uint32_t pageRefreshSeconds = 60;
+  constexpr uint32_t pageRefreshSeconds = 15;
+  const uint32_t manualStartWaitMs = manualStartStopWaitRemainingMs();
+  String transitionDescription = chargingModeTransitionState;
+  if (manualStartWaitMs > 0) {
+    transitionDescription =
+        "Wartezeit nach dem letzten manuellen Stopp: noch " +
+        String((manualStartWaitMs + 59999) / 60000) +
+        " min bis zur erneuten Ladefreigabe.";
+  }
   String msg = "<!DOCTYPE html><html><head><meta http-equiv=\"refresh\" content=\"" +
       String(pageRefreshSeconds) +
-      "\"><title>Danfoss TLX</title></head><style>tr:nth-child(even) {background-color: #f3f3f3;}</style><body><h1>Danfoss TLX</h1><table><tr><th>Description</th><th>Value</th><th>Unit</th><th>Indeks</th></tr>";
+      "\"><title>Vehicle charge controller</title></head><style>tr:nth-child(even) {background-color: #f3f3f3;}button,input,select{margin:0.25rem;padding:0.4rem;}</style><body><h1>Vehicle charge controller</h1><h2>Lademodus</h2><p>Aktuell: " +
+      String(chargingModeText(chargingMode)) + " — " +
+      transitionDescription + (chargingModeTransitionPending ? " (Übergang läuft)" : "") +
+      "</p><p>Go-e-Taster: Start mit 16 A / Auto. Rueckkehr zu PV-Adaptiv bei erkanntem Ausstecken oder nach Nacht und stabilem PV-Neustart.</p><form method=\"post\" action=\"/mode\"><button name=\"mode\" value=\"off\">Aus</button><button name=\"mode\" value=\"pv\">PV-Adaptiv</button></form><form method=\"post\" action=\"/mode\"><input type=\"hidden\" name=\"mode\" value=\"start\"><label>Strom <input type=\"range\" name=\"current_a\" min=\"6\" max=\"16\" value=\"" +
+      String(manualCurrentA) +
+      "\" oninput=\"this.nextElementSibling.value=this.value\"><output>" +
+      String(manualCurrentA) +
+      "</output> A</label><label>Phasen <select name=\"phase\"><option value=\"0\"" +
+      String(manualPhasePreference == 0 ? " selected" : "") +
+      ">Auto</option><option value=\"1\"" +
+      String(manualPhasePreference == 1 ? " selected" : "") +
+      ">Force_1</option><option value=\"2\"" +
+      String(manualPhasePreference == 2 ? " selected" : "") +
+      ">Force_3</option></select></label><button type=\"submit\">Start</button></form><p>Der Strom wird vor dem Start gesetzt. Eine Phasenänderung erfolgt erst bei bestätigter Ladefreigabe und nach den go-e-Mindestwartezeiten.</p><h2>Messwerte</h2><table><tr><th>Description</th><th>Value</th><th>Unit</th><th>Indeks</th></tr>";
   if(MyTLX.TLX.ProductNumber.c_str()[0] != 0 ){ msg += "<tr><td>Product Number</td><td>" + MyTLX.TLX.ProductNumber + "</td><td></td><td></td></tr>" ;}
   if(MyTLX.TLX.SerialNumber.c_str()[0]  != 0 ){ msg += "<tr><td>Serial Number</td><td>" + MyTLX.TLX.SerialNumber + "</td><td></td><td></td></tr>" ;}
   if(MyTLX.TLX.OpModeTxt.c_str()[0] != 0){ msg += "<tr><td>Operation mode</td><td>" + MyTLX.TLX.OpModeTxt + "</td><td></td><td></td></tr>" ;}
@@ -1160,11 +1641,18 @@ void HandleRoot() {
   msg += "<tr><td>DS100 update (ms)</td><td>" + String(meterUpdatedAt) +
          "</td><td></td><td></td></tr>";
   msg += "<tr><th colspan=\"4\">go-e Charger (PV control)</th></tr>";
+  msg += "<tr><td>Charging mode / transition</td><td>" +
+         String(chargingModeText(chargingMode)) + " / " +
+         chargingModeTransitionState +
+         "</td><td></td><td></td></tr>";
   msg += "<tr><td>Status</td><td>" +
          String(goEStatus.valid ? "valid" : "unavailable") +
          "</td><td></td><td></td></tr>";
-  msg += "<tr><td>PV control enabled / state / action</td><td>" +
-         String(GOE_PV_CONTROL_ENABLED ? "yes" : "no") + " / " +
+  msg += "<tr><td>PV adaptive control enabled / state / action</td><td>" +
+         String(GOE_PV_CONTROL_ENABLED &&
+                        chargingMode == ChargingMode::PvAdaptive
+                    ? "yes"
+                    : "no") + " / " +
          pvControlState + " / " + pvControlAction +
          "</td><td></td><td></td></tr>";
   msg += "<tr><td>PV target current / safety reserve</td><td>" +
@@ -1254,6 +1742,72 @@ void HandleRoot() {
   server.send(200, "text/html", msg);
 }
 
+bool parseBoundedIntegerArgument(
+    const char *name, int minimum, int maximum, int &value) {
+  if (!server.hasArg(name)) {
+    return false;
+  }
+
+  String rawValue = server.arg(name);
+  rawValue.trim();
+  if (rawValue.isEmpty()) {
+    return false;
+  }
+  for (size_t i = 0; i < rawValue.length(); ++i) {
+    if (rawValue[i] < '0' || rawValue[i] > '9') {
+      return false;
+    }
+  }
+
+  const long parsedValue = rawValue.toInt();
+  if (parsedValue < minimum || parsedValue > maximum) {
+    return false;
+  }
+  value = static_cast<int>(parsedValue);
+  return true;
+}
+
+void HandleChargingModeRequest() {
+  if (!server.hasArg("mode")) {
+    server.send(400, "text/plain", "Missing charging mode");
+    return;
+  }
+
+  const String requestedMode = server.arg("mode");
+  bool accepted = false;
+  if (requestedMode == "off") {
+    accepted = requestChargingMode(ChargingMode::Off);
+  } else if (requestedMode == "pv") {
+    accepted = requestChargingMode(ChargingMode::PvAdaptive);
+  } else if (requestedMode == "start") {
+    int currentA = 0;
+    int phase = 0;
+    if (!parseBoundedIntegerArgument("current_a", GOE_PV_MIN_CURRENT_A,
+                                     GOE_PV_MAX_CURRENT_A, currentA) ||
+        !parseBoundedIntegerArgument(
+            "phase", static_cast<int>(GoEPhasePreference::Auto),
+            static_cast<int>(GoEPhasePreference::ForceThreePhases), phase)) {
+      server.send(
+          400, "text/plain",
+          "Start requires current_a 6-16 and phase 0-2");
+      return;
+    }
+    accepted = requestChargingMode(
+        ChargingMode::ManualPower, currentA, static_cast<uint8_t>(phase));
+  } else {
+    server.send(400, "text/plain", "Unsupported charging mode");
+    return;
+  }
+
+  if (!accepted) {
+    server.send(400, "text/plain", chargingModeTransitionState);
+    return;
+  }
+
+  server.sendHeader("Location", "/");
+  server.send(303, "text/plain", "Charging mode transition requested");
+}
+
 // Send json object of requested parameter/value. See DanfossTLX::ParName for valid names
 void ReturnTLXMeasValue() {
   String uri = server.uri();
@@ -1329,6 +1883,10 @@ void setup()
   server.on("/Product", []()   { CreateJsonTxt("Product",   MyTLX.TLX.ProductNumber.c_str() ); server.send(200, "application/json", jsonbuffer); }); 
   server.on("/SerialTxt", []() { CreateJsonTxt("Serial",    MyTLX.TLX.SerialNumber.c_str() );  server.send(200, "application/json", jsonbuffer); }); 
   server.on("/All",       []() { CreateJsonAll();  server.send(200, "application/json", jsonbuffer); }); 
+  server.on("/mode", HTTP_GET, []() {
+    server.send(405, "text/plain", "Use POST to change the charging mode");
+  });
+  server.on("/mode", HTTP_POST, HandleChargingModeRequest);
   server.onNotFound(ReturnTLXMeasValue);
   server.begin();
   Serial.println("HTTP server started\nSetup ended");
@@ -1361,6 +1919,7 @@ void loop()
     lastGoEPoll = millis();
     pollGoEStatus();
   }
+  updateManualModeAutomaticReturn();
   updateGoEPhasePolicy(chargingMode);
   updateGoEPvChargingPolicy();
   
