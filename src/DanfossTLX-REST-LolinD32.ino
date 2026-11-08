@@ -73,9 +73,7 @@ constexpr uint32_t GOE_PV_START_STOP_INTERVAL_MS = 300000;
 constexpr uint32_t GOE_PV_STOP_HOLD_MS = 300000;
 constexpr uint32_t GOE_PV_METER_STALE_MS = 30000;
 constexpr uint32_t GOE_PV_SAFETY_STOP_RETRY_MS = 60000;
-constexpr uint32_t GOE_MANUAL_PV_STATUS_MAX_AGE_MS = 90000;
-constexpr uint32_t GOE_MANUAL_PV_OFFLINE_HOLD_MS = 1800000;
-constexpr uint32_t GOE_MANUAL_PV_ONLINE_HOLD_MS = 300000;
+constexpr uint32_t GOE_MANUAL_TLX_STATUS_MAX_AGE_MS = 90000;
 constexpr uint32_t GOE_MANUAL_UNPLUG_CONFIRM_SAMPLES = 2;
 constexpr uint32_t GOE_PV_LIMIT_CURRENT_ERROR_COUNT = 3;
 constexpr uint32_t GOE_PV_STOP_ERROR_COUNT = 6;
@@ -83,8 +81,6 @@ constexpr int GOE_PV_MIN_CURRENT_A = 6;
 constexpr int GOE_PV_MAX_CURRENT_A = 16;
 constexpr float GOE_PV_PHASE_VOLTAGE_V = 230.0f;
 constexpr float GOE_PV_SAFETY_RESERVE_W = 500.0f;
-constexpr float GOE_MANUAL_PV_OFFLINE_THRESHOLD_W = 50.0f;
-constexpr float GOE_MANUAL_PV_ONLINE_THRESHOLD_W = 100.0f;
 constexpr uint8_t GOE_GRID_POWER_SAMPLE_CAPACITY = 16;
 
 struct GridPowerSample {
@@ -121,8 +117,6 @@ bool manualPvReturnArmed = false;
 bool manualCarConnectedSeen = false;
 uint8_t manualUnplugSampleCount = 0;
 uint32_t manualLastCarStateSampleAt = 0;
-uint32_t manualPvOfflineSince = 0;
-uint32_t manualPvOnlineSince = 0;
 bool manualPvNightObserved = false;
 
 struct GoEStatus {
@@ -295,8 +289,6 @@ bool requestChargingMode(
           goEStatus.carState >= 2 && goEStatus.carState <= 4;
       manualUnplugSampleCount = 0;
       manualLastCarStateSampleAt = 0;
-      manualPvOfflineSince = 0;
-      manualPvOnlineSince = 0;
       manualPvNightObserved = false;
     }
     if (mode == ChargingMode::Off &&
@@ -313,8 +305,6 @@ bool requestChargingMode(
       manualCarConnectedSeen = false;
       manualUnplugSampleCount = 0;
       manualLastCarStateSampleAt = 0;
-      manualPvOfflineSince = 0;
-      manualPvOnlineSince = 0;
       manualPvNightObserved = false;
     }
   }
@@ -732,25 +722,6 @@ void pollGoEStatus() {
   Serial.println("]");
 }
 
-bool getFreshTlxPvInputPower(float &powerW) {
-  const uint32_t now = millis();
-  const DanfossTLX::Par_e readings[] = {
-      DanfossTLX::PvV1, DanfossTLX::PvV2,
-      DanfossTLX::PvA1, DanfossTLX::PvA2};
-  for (const DanfossTLX::Par_e reading : readings) {
-    if (!MyTLX.TLX.Valid[reading] ||
-        now - MyTLX.TLX.UpdatedAt[reading] >
-            GOE_MANUAL_PV_STATUS_MAX_AGE_MS) {
-      return false;
-    }
-  }
-  powerW = MyTLX.TLX.Meas[DanfossTLX::PvV1] *
-          MyTLX.TLX.Meas[DanfossTLX::PvA1] +
-      MyTLX.TLX.Meas[DanfossTLX::PvV2] *
-          MyTLX.TLX.Meas[DanfossTLX::PvA2];
-  return true;
-}
-
 void returnToPvAdaptiveMode(const char *reason) {
   if (chargingMode == ChargingMode::PvAdaptive || !manualPvReturnArmed) {
     return;
@@ -791,35 +762,20 @@ void updateManualModeAutomaticReturn() {
     return;
   }
 
-  float pvInputPowerW = 0.0f;
-  if (!getFreshTlxPvInputPower(pvInputPowerW)) {
-    manualPvOfflineSince = 0;
-    manualPvOnlineSince = 0;
+  if (!MyTLX.TLX.Valid[DanfossTLX::OpMode] ||
+      now - MyTLX.TLX.UpdatedAt[DanfossTLX::OpMode] >
+          GOE_MANUAL_TLX_STATUS_MAX_AGE_MS) {
     return;
   }
 
-  if (pvInputPowerW <= GOE_MANUAL_PV_OFFLINE_THRESHOLD_W) {
-    if (manualPvOfflineSince == 0) {
-      manualPvOfflineSince = now;
-    }
-    manualPvOnlineSince = 0;
-    if (now - manualPvOfflineSince >= GOE_MANUAL_PV_OFFLINE_HOLD_MS) {
-      manualPvNightObserved = true;
-    }
-  } else {
-    manualPvOfflineSince = 0;
+  if (MyTLX.TLXMode == DanfossTLX::OFFGRIDOFF) {
+    manualPvNightObserved = true;
+    return;
   }
 
   if (manualPvNightObserved &&
-      pvInputPowerW >= GOE_MANUAL_PV_ONLINE_THRESHOLD_W) {
-    if (manualPvOnlineSince == 0) {
-      manualPvOnlineSince = now;
-    }
-    if (now - manualPvOnlineSince >= GOE_MANUAL_PV_ONLINE_HOLD_MS) {
-      returnToPvAdaptiveMode("PV production resumed after night");
-    }
-  } else {
-    manualPvOnlineSince = 0;
+      MyTLX.TLXMode == DanfossTLX::ONGRID) {
+    returnToPvAdaptiveMode("inverter returned on grid after night");
   }
 }
 
@@ -1614,7 +1570,7 @@ void HandleRoot() {
       "\"><title>Vehicle charge controller</title></head><style>tr:nth-child(even) {background-color: #f3f3f3;}button,input,select{margin:0.25rem;padding:0.4rem;}</style><body><h1>Vehicle charge controller</h1><h2>Lademodus</h2><p>Aktuell: " +
       String(chargingModeText(chargingMode)) + " — " +
       transitionDescription + (chargingModeTransitionPending ? " (Übergang läuft)" : "") +
-      "</p><p>Go-e-Taster: Start mit 16 A / Auto. Rueckkehr zu PV-Adaptiv bei erkanntem Ausstecken oder nach Nacht und stabilem PV-Neustart.</p><form method=\"post\" action=\"/mode\"><button name=\"mode\" value=\"off\">Aus</button><button name=\"mode\" value=\"pv\">PV-Adaptiv</button></form><form method=\"post\" action=\"/mode\"><input type=\"hidden\" name=\"mode\" value=\"start\"><label>Strom <input type=\"range\" name=\"current_a\" min=\"6\" max=\"16\" value=\"" +
+      "</p><p>Go-e-Taster: Start mit 16 A / Auto. Rueckkehr zu PV-Adaptiv bei erkanntem Ausstecken oder wenn der Wechselrichter nach der Nacht wieder On Grid meldet.</p><form method=\"post\" action=\"/mode\"><button name=\"mode\" value=\"off\">Aus</button><button name=\"mode\" value=\"pv\">PV-Adaptiv</button></form><form method=\"post\" action=\"/mode\"><input type=\"hidden\" name=\"mode\" value=\"start\"><label>Strom <input type=\"range\" name=\"current_a\" min=\"6\" max=\"16\" value=\"" +
       String(manualCurrentA) +
       "\" oninput=\"this.nextElementSibling.value=this.value\"><output>" +
       String(manualCurrentA) +

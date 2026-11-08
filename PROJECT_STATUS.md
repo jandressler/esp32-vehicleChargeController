@@ -715,10 +715,9 @@ allgemeinen Web-Schreibendpunkt.
   anhand zweier aufeinanderfolgender frischer go-e-Statuspolls und wechselt
   zurück auf `PV-Adaptiv`. Ein allein gewähltes `Aus` ohne vorherigen
   manuellen Start bleibt dagegen `Aus`.
-- Implementiert: ohne Uhr wird Nacht anhand der frischen TLX-PV-Eingangsleistung
-  erkannt (höchstens 50 W für 30 min); nach anschließend mindestens 5 min über
-  100 W wird auf `PV-Adaptiv` zurückgeschaltet. Ungültige/veraltete TLX-Werte
-  setzen die laufenden Zeitfenster zurück.
+- Implementiert: ein frischer TLX-Status `Off Grid, OFF` erkennt die Nacht;
+  sobald der Wechselrichter danach wieder `On Grid` meldet, wird direkt auf
+  `PV-Adaptiv` zurückgeschaltet.
 - Noch live zu testen: Ausstecken nach manuellem Start und `Aus`, Tasterstart
   sowie der Nacht-/PV-Neustart-Ablauf.
 - Firmware am 08.11.2026 gebaut und geflasht. Nach Neustart bestätigt:
