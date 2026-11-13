@@ -15,7 +15,7 @@ freigeben.
 
 ## Regelverhalten
 
-- PV-Überschuss: 60-s-Mittelwert und 500 W Sicherheitsreserve.
+- PV-Überschuss: 60-s-Mittelwert und 400 W Sicherheitsreserve.
 - Start: ausreichende Reserve muss 5 min anliegen; Start-/Stopp-Befehle liegen
   im PV-Regelbetrieb mindestens 5 min auseinander. Ein manueller Start aus
   Force-Off wartet nicht auf den Startup-Stop; nach einem bestätigten
@@ -27,7 +27,17 @@ freigeben.
   die 5-minütige Sperre nach einem bestätigten manuellen Stopp gilt weiterhin.
 - Phasen: Wechsel erst nach 10 min stabiler Anforderung und frühestens 10 min
   nach dem vorherigen Phasenbefehl. Umschaltung auf drei Phasen ab 5.2 kW,
-  zurück auf eine Phase unter 5.0 kW.
+  zurück auf eine Phase unter 5.0 kW. Die UI-Phasenwahl gilt global: `Force_1`
+  und `Force_3` sind feste Vorgaben, `Auto` nutzt im PV-Modus diese
+  Überschussautomatik und beim manuellen Start die go-e-Automatik. Die Auswahl
+  wirkt auch im Modus `Aus`; nach einem Neustart ist sie standardmäßig `Auto`.
+- Beim bestätigten Ausstecken wird `frc=1` gesetzt. Im PV-Modus startet die
+  Steuerung erst wieder, wenn ein Fahrzeug erkannt wird und die Startreserve
+  erneut 5 min stabil anliegt.
+- Die DS100-Anzeige vergleicht eine aus Phasenstrom und -spannung geschätzte
+  Scheinleistung (VA) mit der gemessenen Wirkleistung (W). Strom × Spannung
+  ergibt nicht automatisch Wirkleistung; dafür ist auch der Leistungsfaktor
+  maßgeblich.
 - go-e-Statusabfrage: alle 15 s; ein Status älter als 45 s gilt als veraltet.
 - Ein Tastendruck am go-e startet mit 16 A und Phasenwahl `Auto`. Nach einem
   manuellen Start kehrt der Controller bei erkanntem Ausstecken des Fahrzeugs

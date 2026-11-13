@@ -19,6 +19,8 @@
 #include <WebServer.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
+#include <math.h>
+#include <string.h>
 
 enum class ChargingMode : uint8_t;
 
@@ -80,7 +82,7 @@ constexpr uint32_t GOE_PV_STOP_ERROR_COUNT = 6;
 constexpr int GOE_PV_MIN_CURRENT_A = 6;
 constexpr int GOE_PV_MAX_CURRENT_A = 16;
 constexpr float GOE_PV_PHASE_VOLTAGE_V = 230.0f;
-constexpr float GOE_PV_SAFETY_RESERVE_W = 500.0f;
+constexpr float GOE_PV_SAFETY_RESERVE_W = 400.0f;
 constexpr uint8_t GOE_GRID_POWER_SAMPLE_CAPACITY = 16;
 
 struct GridPowerSample {
@@ -118,6 +120,13 @@ bool manualCarConnectedSeen = false;
 uint8_t manualUnplugSampleCount = 0;
 uint32_t manualLastCarStateSampleAt = 0;
 bool manualPvNightObserved = false;
+bool carWasConnected = false;
+uint32_t lastCarStateSafetySampleAt = 0;
+uint8_t unplugSafetySampleCount = 0;
+bool carUnplugStopPending = false;
+uint32_t carUnplugStopLastAttemptAt = 0;
+const char *pvControlStateTimed = nullptr;
+uint32_t pvControlStateSince = 0;
 
 struct GoEStatus {
   bool valid = false;
@@ -199,6 +208,9 @@ enum class GoEPhaseRequestResult : uint8_t {
   WaitingForChargerInterval,
   WriteFailed
 };
+
+GoEPhaseRequestResult requestGoEPhasePreference(
+    uint8_t preference, uint32_t desiredSinceMs, bool allowWhenStopped);
 
 ChargingMode chargingMode = ChargingMode::PvAdaptive;
 int manualCurrentA = GOE_PV_MAX_CURRENT_A;
@@ -449,7 +461,7 @@ void updateNonAdaptiveChargingMode() {
   }
   if (goEStatus.phasePreference != manualPhasePreference) {
     const GoEPhaseRequestResult phaseRequest = requestGoEPhasePreference(
-        manualPhasePreference, modePhaseRequestedAt);
+        manualPhasePreference, modePhaseRequestedAt, false);
     switch (phaseRequest) {
       case GoEPhaseRequestResult::CommandSent:
         modeLastCommandAt = now;
@@ -632,26 +644,33 @@ void pollGoEStatus() {
 
   static bool buttonPressBaselineValid = false;
   static int64_t previousButtonPressMs = 0;
-  static uint32_t previousButtonPollAt = 0;
+  static bool previousChargerUptimeValid = false;
+  static int64_t previousChargerUptimeMs = 0;
   bool buttonPressDetected = false;
   if (goEStatus.lastButtonPressValid) {
+    const bool chargerRestarted =
+        previousChargerUptimeValid && goEStatus.chargerUptimeValid &&
+        goEStatus.chargerUptimeMs < previousChargerUptimeMs;
     if (buttonPressBaselineValid &&
-        goEStatus.lastButtonPressMs > previousButtonPressMs &&
-        goEStatus.updatedAt - previousButtonPollAt <=
-            GOE_POLL_INTERVAL_MS * 2) {
+        !chargerRestarted &&
+        goEStatus.lastButtonPressMs > previousButtonPressMs) {
       buttonPressDetected = true;
     }
     previousButtonPressMs = goEStatus.lastButtonPressMs;
-    previousButtonPollAt = goEStatus.updatedAt;
     buttonPressBaselineValid = true;
   } else {
     buttonPressBaselineValid = false;
   }
+  previousChargerUptimeValid = goEStatus.chargerUptimeValid;
+  previousChargerUptimeMs = goEStatus.chargerUptimeMs;
   if (buttonPressDetected) {
-    Serial.println("go-e button press detected; requesting 16A Auto start");
+    Serial.printf(
+        "go-e button press detected: lbp=%lld; requesting 16A %s start\n",
+        static_cast<long long>(goEStatus.lastButtonPressMs),
+        phasePreferenceText(manualPhasePreference));
     requestChargingMode(
         ChargingMode::ManualPower, GOE_PV_MAX_CURRENT_A,
-        static_cast<uint8_t>(GoEPhasePreference::Auto));
+        manualPhasePreference);
   }
 
   static bool previousSampleValid = false;
@@ -885,7 +904,7 @@ bool writeGoEForceMode(uint8_t forceMode) {
 }
 
 GoEPhaseRequestResult requestGoEPhasePreference(
-    uint8_t preference, uint32_t desiredSinceMs) {
+    uint8_t preference, uint32_t desiredSinceMs, bool allowWhenStopped) {
   if (preference > static_cast<uint8_t>(GoEPhasePreference::ForceThreePhases) ||
       !goEStatus.valid || !goEStatus.phasePreferenceValid ||
       millis() - goEStatus.updatedAt > GOE_PHASE_STATUS_MAX_AGE_MS) {
@@ -894,7 +913,10 @@ GoEPhaseRequestResult requestGoEPhasePreference(
   if (goEStatus.phasePreference == preference) {
     return GoEPhaseRequestResult::AlreadySet;
   }
-  if (!goEStatus.chargeAllowed || goEStatus.forceMode != 0) {
+  const bool chargerStopped = goEStatus.forceMode == 1 &&
+      !goEStatus.chargeAllowed;
+  if ((!goEStatus.chargeAllowed || goEStatus.forceMode != 0) &&
+      !(allowWhenStopped && chargerStopped)) {
     return GoEPhaseRequestResult::WaitingForChargePermission;
   }
 
@@ -948,8 +970,7 @@ void updateGoEPhasePolicy(ChargingMode mode) {
     phaseTargetInitialized = false;
     return;
   }
-  if (mode != ChargingMode::PvAdaptive) {
-    phaseTargetInitialized = false;
+  if (mode == ChargingMode::ManualPower) {
     return;
   }
   if (!goEStatus.valid || !goEStatus.phasePreferenceValid ||
@@ -958,8 +979,13 @@ void updateGoEPhasePolicy(ChargingMode mode) {
     return;
   }
 
-  uint8_t requestedPreference = static_cast<uint8_t>(GoEPhasePreference::Auto);
-  if (mode == ChargingMode::PvAdaptive) {
+  uint8_t requestedPreference = manualPhasePreference;
+  if (mode == ChargingMode::Off &&
+      manualPhasePreference == static_cast<uint8_t>(GoEPhasePreference::Auto)) {
+    requestedPreference = static_cast<uint8_t>(GoEPhasePreference::Auto);
+  } else if (mode == ChargingMode::PvAdaptive &&
+             manualPhasePreference ==
+                 static_cast<uint8_t>(GoEPhasePreference::Auto)) {
     const MeterReading &gridPower = meterReadings[METER_READING_COUNT - 1];
     if (!gridPower.valid || millis() - meterUpdatedAt > METER_STATUS_MAX_AGE_MS) {
       phaseTargetInitialized = false;
@@ -997,9 +1023,9 @@ void updateGoEPhasePolicy(ChargingMode mode) {
                   phasePreferenceText(phaseTarget));
   }
 
-  if (goEStatus.chargeAllowed && goEStatus.forceMode == 0 &&
-      phaseTarget != goEStatus.phasePreference) {
-    requestGoEPhasePreference(phaseTarget, phaseTargetSince);
+  if (phaseTarget != goEStatus.phasePreference) {
+    requestGoEPhasePreference(
+        phaseTarget, phaseTargetSince, goEStatus.forceMode == 1);
   }
 }
 
@@ -1021,7 +1047,45 @@ void updateGridPowerMean() {
 
 }
 
+void updatePvControlStateTimer() {
+  if (pvControlStateTimed != pvControlState) {
+    pvControlStateTimed = pvControlState;
+    pvControlStateSince = millis();
+  }
+}
+
+uint32_t pvControlStateDurationMs() {
+  return pvControlStateTimed == pvControlState
+      ? millis() - pvControlStateSince
+      : 0;
+}
+
+bool pvStartWaitRemainingMs(uint32_t &remainingMs) {
+  if (pvStartConditionSince == 0 ||
+      (strcmp(pvControlState, "START_RESERVE_HOLD") != 0 &&
+       strcmp(pvControlState, "START_WAITING_FOR_MIN_INTERVAL") != 0)) {
+    return false;
+  }
+
+  const uint32_t now = millis();
+  const uint32_t holdElapsedMs = now - pvStartConditionSince;
+  const uint32_t holdRemainingMs = holdElapsedMs < GOE_PV_START_HOLD_MS
+      ? GOE_PV_START_HOLD_MS - holdElapsedMs
+      : 0;
+  const uint32_t startStopElapsedMs = now - pvLastStartStopCommandAt;
+  const uint32_t startStopRemainingMs =
+      pvStartStopClockInitialized &&
+              startStopElapsedMs < GOE_PV_START_STOP_INTERVAL_MS
+          ? GOE_PV_START_STOP_INTERVAL_MS - startStopElapsedMs
+          : 0;
+  remainingMs = max(holdRemainingMs, startStopRemainingMs);
+  return true;
+}
+
 uint8_t getGoEActivePhaseCount() {
+  if (goEStatus.forceSinglePhaseValid && goEStatus.forceSinglePhase) {
+    return 1;
+  }
   if (goEStatus.phasePreferenceValid &&
       goEStatus.phasePreference ==
           static_cast<uint8_t>(GoEPhasePreference::ForceThreePhases)) {
@@ -1033,6 +1097,56 @@ uint8_t getGoEActivePhaseCount() {
     return 1;
   }
   return goEStatus.phaseCountValid && goEStatus.phaseCount == 3 ? 3 : 1;
+}
+
+void updateCarUnplugSafety() {
+  const uint32_t now = millis();
+  if (!goEStatus.valid ||
+      now - goEStatus.updatedAt > GOE_PHASE_STATUS_MAX_AGE_MS) {
+    return;
+  }
+
+  if (goEStatus.updatedAt != lastCarStateSafetySampleAt) {
+    lastCarStateSafetySampleAt = goEStatus.updatedAt;
+    if (goEStatus.carStateValid &&
+        goEStatus.carState >= 2 && goEStatus.carState <= 4) {
+      carWasConnected = true;
+      unplugSafetySampleCount = 0;
+    } else if (goEStatus.carStateValid && goEStatus.carState == 1 &&
+               carWasConnected) {
+      if (unplugSafetySampleCount < GOE_MANUAL_UNPLUG_CONFIRM_SAMPLES) {
+        ++unplugSafetySampleCount;
+      }
+      if (unplugSafetySampleCount >= GOE_MANUAL_UNPLUG_CONFIRM_SAMPLES) {
+        carWasConnected = false;
+        carUnplugStopPending = true;
+        carUnplugStopLastAttemptAt = 0;
+        pvControllerCharging = false;
+        pvStartConditionSince = 0;
+        pvStopConditionSince = 0;
+        Serial.println("vehicle unplugged; forcing go-e force mode to stopped");
+      }
+    } else {
+      unplugSafetySampleCount = 0;
+    }
+  }
+
+  if (carUnplugStopPending && goEStatus.forceMode == 1 &&
+      !goEStatus.chargeAllowed) {
+    carUnplugStopPending = false;
+    pvLastStartStopCommandAt = now;
+    pvStartStopClockInitialized = true;
+    return;
+  }
+  if (carUnplugStopPending &&
+      (carUnplugStopLastAttemptAt == 0 ||
+       now - carUnplugStopLastAttemptAt >= GOE_PV_SAFETY_STOP_RETRY_MS)) {
+    carUnplugStopLastAttemptAt = now;
+    if (writeGoEForceMode(1)) {
+      pvLastStartStopCommandAt = now;
+      pvStartStopClockInitialized = true;
+    }
+  }
 }
 
 void updateGoEPvChargingPolicy() {
@@ -1068,6 +1182,11 @@ void updateGoEPvChargingPolicy() {
         pvControlState = "STARTUP_STOP_FAILED_RETRYING";
       }
     }
+    return;
+  }
+  if (carUnplugStopPending) {
+    pvControlState = "CAR_UNPLUG_STOP_PENDING";
+    pvControlAction = "STOP";
     return;
   }
   if (chargingMode != ChargingMode::PvAdaptive) {
@@ -1185,6 +1304,14 @@ void updateGoEPvChargingPolicy() {
         pvLastStartStopCommandAt = now;
       }
     }
+    return;
+  }
+
+  if (!pvControllerCharging &&
+      (!goEStatus.carStateValid || goEStatus.carState == 1)) {
+    pvStartConditionSince = 0;
+    pvTargetCurrentA = GOE_PV_MIN_CURRENT_A;
+    pvControlState = "WAITING_FOR_VEHICLE";
     return;
   }
 
@@ -1382,6 +1509,25 @@ void readMeterSnapshot() {
   Serial.println("DS100 poll complete; UART restored to TLX 19200 baud");
 }
 
+bool getDs100PowerQualityEstimate(float &apparentPowerVa, float &powerFactor) {
+  apparentPowerVa = 0.0f;
+  for (size_t phase = 0; phase < 3; ++phase) {
+    const MeterReading &voltage = meterReadings[phase];
+    const MeterReading &current = meterReadings[phase + 3];
+    if (!voltage.valid || !current.valid) {
+      return false;
+    }
+    apparentPowerVa += fabsf(voltage.value * current.value);
+  }
+
+  const MeterReading &activePower = meterReadings[METER_READING_COUNT - 1];
+  if (!activePower.valid || apparentPowerVa == 0.0f) {
+    return false;
+  }
+  powerFactor = fabsf(activePower.value) / apparentPowerVa;
+  return true;
+}
+
 // All values from TLX in one json respons without units
 void CreateJsonAll(void){
   jsonDocument.clear();
@@ -1403,6 +1549,15 @@ void CreateJsonAll(void){
     reading["unit"] = meterUnits[i];
     reading["valid"] = meterReadings[i].valid;
   }
+  float apparentPowerVa = 0.0f;
+  float powerFactor = 0.0f;
+  if (getDs100PowerQualityEstimate(apparentPowerVa, powerFactor)) {
+    ds100["apparent_power_estimate_va"] = apparentPowerVa;
+    ds100["power_factor_estimate"] = powerFactor;
+  } else {
+    ds100["apparent_power_estimate_va"] = nullptr;
+    ds100["power_factor_estimate"] = nullptr;
+  }
   JsonObject charger = jsonDocument["goe"].to<JsonObject>();
   charger["valid"] = goEStatus.valid;
   charger["updated_ms"] = goEStatus.updatedAt;
@@ -1422,6 +1577,14 @@ void CreateJsonAll(void){
       manualStartStopWaitRemainingMs();
   charger["pv_control_state"] = pvControlState;
   charger["pv_control_action"] = pvControlAction;
+  charger["pv_control_state_duration_ms"] = pvControlStateDurationMs();
+  uint32_t pvStartWaitMs = 0;
+  if (pvStartWaitRemainingMs(pvStartWaitMs)) {
+    charger["pv_start_wait_remaining_ms"] = pvStartWaitMs;
+  } else {
+    charger["pv_start_wait_remaining_ms"] = nullptr;
+  }
+  charger["car_unplug_stop_pending"] = carUnplugStopPending;
   charger["pv_target_current_a"] = pvTargetCurrentA;
   charger["ds100_power_error_count"] = meterPowerErrorCount;
   charger["ds100_power_consecutive_errors"] = meterPowerConsecutiveErrors;
@@ -1558,6 +1721,13 @@ void CreateJsonTxt(const char *tag, const char *value) {
 void HandleRoot() {
   constexpr uint32_t pageRefreshSeconds = 15;
   const uint32_t manualStartWaitMs = manualStartStopWaitRemainingMs();
+  const uint32_t pvStateDurationSeconds = pvControlStateDurationMs() / 1000;
+  uint32_t pvStartWaitMs = 0;
+  const bool pvStartWaitActive = pvStartWaitRemainingMs(pvStartWaitMs);
+  float apparentPowerVa = 0.0f;
+  float powerFactor = 0.0f;
+  const bool powerQualityEstimateValid =
+      getDs100PowerQualityEstimate(apparentPowerVa, powerFactor);
   String transitionDescription = chargingModeTransitionState;
   if (manualStartWaitMs > 0) {
     transitionDescription =
@@ -1570,17 +1740,17 @@ void HandleRoot() {
       "\"><title>Vehicle charge controller</title></head><style>tr:nth-child(even) {background-color: #f3f3f3;}button,input,select{margin:0.25rem;padding:0.4rem;}</style><body><h1>Vehicle charge controller</h1><h2>Lademodus</h2><p>Aktuell: " +
       String(chargingModeText(chargingMode)) + " — " +
       transitionDescription + (chargingModeTransitionPending ? " (Übergang läuft)" : "") +
-      "</p><p>Go-e-Taster: Start mit 16 A / Auto. Rueckkehr zu PV-Adaptiv bei erkanntem Ausstecken oder wenn der Wechselrichter nach der Nacht wieder On Grid meldet.</p><form method=\"post\" action=\"/mode\"><button name=\"mode\" value=\"off\">Aus</button><button name=\"mode\" value=\"pv\">PV-Adaptiv</button></form><form method=\"post\" action=\"/mode\"><input type=\"hidden\" name=\"mode\" value=\"start\"><label>Strom <input type=\"range\" name=\"current_a\" min=\"6\" max=\"16\" value=\"" +
-      String(manualCurrentA) +
-      "\" oninput=\"this.nextElementSibling.value=this.value\"><output>" +
-      String(manualCurrentA) +
-      "</output> A</label><label>Phasen <select name=\"phase\"><option value=\"0\"" +
+      "</p><p>Go-e-Taster: Start mit 16 A / Auto. Rueckkehr zu PV-Adaptiv bei erkanntem Ausstecken oder wenn der Wechselrichter nach der Nacht wieder On Grid meldet.</p><form method=\"post\" action=\"/mode\"><button name=\"mode\" value=\"off\">Aus</button><button name=\"mode\" value=\"pv\">PV-Adaptiv</button></form><form method=\"post\" action=\"/phase\"><label>Phasenwahl (gilt auch im PV-Modus) <select name=\"phase\"><option value=\"0\"" +
       String(manualPhasePreference == 0 ? " selected" : "") +
-      ">Auto</option><option value=\"1\"" +
+      ">Auto (PV-Überschuss)</option><option value=\"1\"" +
       String(manualPhasePreference == 1 ? " selected" : "") +
       ">Force_1</option><option value=\"2\"" +
       String(manualPhasePreference == 2 ? " selected" : "") +
-      ">Force_3</option></select></label><button type=\"submit\">Start</button></form><p>Der Strom wird vor dem Start gesetzt. Eine Phasenänderung erfolgt erst bei bestätigter Ladefreigabe und nach den go-e-Mindestwartezeiten.</p><h2>Messwerte</h2><table><tr><th>Description</th><th>Value</th><th>Unit</th><th>Indeks</th></tr>";
+      ">Force_3</option></select></label><button type=\"submit\">Phasenwahl übernehmen</button></form><form method=\"post\" action=\"/mode\"><input type=\"hidden\" name=\"mode\" value=\"start\"><label>Strom <input type=\"range\" name=\"current_a\" min=\"6\" max=\"16\" value=\"" +
+      String(manualCurrentA) +
+      "\" oninput=\"this.nextElementSibling.value=this.value\"><output>" +
+      String(manualCurrentA) +
+      "</output> A</label><button type=\"submit\">Start</button></form><p>Der Strom wird vor dem Start gesetzt. Eine Phasenänderung erfolgt erst bei bestätigter Ladefreigabe und nach den go-e-Mindestwartezeiten. Auto wählt im PV-Modus die Phasen nach Überschuss; Force_1/Force_3 bleiben fest.</p><h2>Messwerte</h2><table><tr><th>Description</th><th>Value</th><th>Unit</th><th>Indeks</th></tr>";
   if(MyTLX.TLX.ProductNumber.c_str()[0] != 0 ){ msg += "<tr><td>Product Number</td><td>" + MyTLX.TLX.ProductNumber + "</td><td></td><td></td></tr>" ;}
   if(MyTLX.TLX.SerialNumber.c_str()[0]  != 0 ){ msg += "<tr><td>Serial Number</td><td>" + MyTLX.TLX.SerialNumber + "</td><td></td><td></td></tr>" ;}
   if(MyTLX.TLX.OpModeTxt.c_str()[0] != 0){ msg += "<tr><td>Operation mode</td><td>" + MyTLX.TLX.OpModeTxt + "</td><td></td><td></td></tr>" ;}
@@ -1594,6 +1764,11 @@ void HandleRoot() {
     msg += "</td><td>" + String(meterUnits[i]) + "</td><td>";
     msg += "0x" + String(meterRegisters[i], HEX) + "</td></tr>";
   }
+  msg += "<tr><td>Estimated apparent power / power factor</td><td>" +
+         (powerQualityEstimateValid
+              ? String(apparentPowerVa, 0) + " / " + String(powerFactor, 3)
+              : String("n/a")) +
+         "</td><td>VA / -</td><td>currents x phase voltages vs 0x0420</td></tr>";
   msg += "<tr><td>DS100 update (ms)</td><td>" + String(meterUpdatedAt) +
          "</td><td></td><td></td></tr>";
   msg += "<tr><th colspan=\"4\">go-e Charger (PV control)</th></tr>";
@@ -1611,6 +1786,22 @@ void HandleRoot() {
                     : "no") + " / " +
          pvControlState + " / " + pvControlAction +
          "</td><td></td><td></td></tr>";
+  msg += "<tr><td>PV state duration</td><td><span id=\"pv-state-age\" data-seconds=\"" +
+         String(pvStateDurationSeconds) + "\">" +
+         String(pvStateDurationSeconds) +
+         " s</span></td><td>s</td><td></td></tr>";
+  msg += "<tr><td>PV start wait remaining</td><td>";
+  if (pvStartWaitActive) {
+    const uint32_t pvStartWaitSeconds = (pvStartWaitMs + 999) / 1000;
+    msg += "<span id=\"pv-start-wait\" data-seconds=\"" +
+           String(pvStartWaitSeconds) + "\">" +
+           String(pvStartWaitSeconds) + " s</span>";
+  } else if (strcmp(pvControlState, "WAITING_FOR_START_RESERVE") == 0) {
+    msg += "reserve below threshold; timer reset";
+  } else {
+    msg += "not active";
+  }
+  msg += "</td><td>s</td><td>5-min reserve / minimum start interval</td></tr>";
   msg += "<tr><td>PV target current / safety reserve</td><td>" +
          String(pvTargetCurrentA) + " / " +
          String(GOE_PV_SAFETY_RESERVE_W, 0) +
@@ -1694,7 +1885,7 @@ void HandleRoot() {
     msg += "<tr><td>Read error</td><td>" + goEStatus.error +
            "</td><td></td><td></td></tr>";
   }
-  msg += "</body></html>";
+  msg += "<script>setInterval(function(){var age=document.getElementById('pv-state-age');if(age){var seconds=Number(age.dataset.seconds)+1;age.dataset.seconds=seconds;age.textContent=seconds+' s';}var wait=document.getElementById('pv-start-wait');if(wait){var seconds=Math.max(0,Number(wait.dataset.seconds)-1);wait.dataset.seconds=seconds;wait.textContent=seconds+' s';}},1000);</script></body></html>";
   server.send(200, "text/html", msg);
 }
 
@@ -1737,19 +1928,13 @@ void HandleChargingModeRequest() {
     accepted = requestChargingMode(ChargingMode::PvAdaptive);
   } else if (requestedMode == "start") {
     int currentA = 0;
-    int phase = 0;
     if (!parseBoundedIntegerArgument("current_a", GOE_PV_MIN_CURRENT_A,
-                                     GOE_PV_MAX_CURRENT_A, currentA) ||
-        !parseBoundedIntegerArgument(
-            "phase", static_cast<int>(GoEPhasePreference::Auto),
-            static_cast<int>(GoEPhasePreference::ForceThreePhases), phase)) {
-      server.send(
-          400, "text/plain",
-          "Start requires current_a 6-16 and phase 0-2");
+                                     GOE_PV_MAX_CURRENT_A, currentA)) {
+      server.send(400, "text/plain", "Start requires current_a 6-16");
       return;
     }
     accepted = requestChargingMode(
-        ChargingMode::ManualPower, currentA, static_cast<uint8_t>(phase));
+        ChargingMode::ManualPower, currentA, manualPhasePreference);
   } else {
     server.send(400, "text/plain", "Unsupported charging mode");
     return;
@@ -1762,6 +1947,38 @@ void HandleChargingModeRequest() {
 
   server.sendHeader("Location", "/");
   server.send(303, "text/plain", "Charging mode transition requested");
+}
+
+void HandlePhasePreferenceRequest() {
+  int phase = 0;
+  if (!parseBoundedIntegerArgument(
+          "phase", static_cast<int>(GoEPhasePreference::Auto),
+          static_cast<int>(GoEPhasePreference::ForceThreePhases), phase)) {
+    server.send(400, "text/plain", "Phase preference must be 0-2");
+    return;
+  }
+
+  const uint8_t requestedPreference = static_cast<uint8_t>(phase);
+  if (requestedPreference == manualPhasePreference) {
+    server.sendHeader("Location", "/");
+    server.send(303, "text/plain", "Phase preference unchanged");
+    return;
+  }
+  manualPhasePreference = requestedPreference;
+  modePhaseRequestedAt = millis();
+  phaseTargetInitialized = false;
+
+  if (chargingMode == ChargingMode::ManualPower) {
+    chargingModeTransitionState = "PHASE_PREFERENCE_CHANGED";
+    chargingModeTransitionPending = true;
+    modeCommandAwaitingStatus = false;
+    modeCommandClockInitialized = false;
+  }
+
+  Serial.printf("phase preference selected: %s\n",
+                phasePreferenceText(manualPhasePreference));
+  server.sendHeader("Location", "/");
+  server.send(303, "text/plain", "Phase preference updated");
 }
 
 // Send json object of requested parameter/value. See DanfossTLX::ParName for valid names
@@ -1843,6 +2060,7 @@ void setup()
     server.send(405, "text/plain", "Use POST to change the charging mode");
   });
   server.on("/mode", HTTP_POST, HandleChargingModeRequest);
+  server.on("/phase", HTTP_POST, HandlePhasePreferenceRequest);
   server.onNotFound(ReturnTLXMeasValue);
   server.begin();
   Serial.println("HTTP server started\nSetup ended");
@@ -1875,9 +2093,11 @@ void loop()
     lastGoEPoll = millis();
     pollGoEStatus();
   }
+  updateCarUnplugSafety();
   updateManualModeAutomaticReturn();
   updateGoEPhasePolicy(chargingMode);
   updateGoEPvChargingPolicy();
+  updatePvControlStateTimer();
   
   // Test if connected
   if(WiFi.status() != WL_CONNECTED){
